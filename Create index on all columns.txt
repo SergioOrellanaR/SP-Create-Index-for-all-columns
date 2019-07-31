@@ -1,0 +1,226 @@
+--El presente procedimiento tiene 2 caminos posibles.
+--En caso que input sea 1, creará índices para todas las columnas en la database en que se ejecuta en que no exista ya uno
+--En caso que input sea 2, el procedimiento eliminará todos los índices creados previamente con este procedimiento
+ALTER PROCEDURE [dbo].[CREATE_OR_DELETE_INDEXES] 
+	@Input smallint = 0,
+	@OutMessage varchar(510) OUTPUT
+AS 
+BEGIN
+	--Variables para manejar datos de columna de tabla
+	DECLARE @ColumnQuantity			int				= NULL
+	DECLARE @IndexName				varchar(510)	= NULL
+	DECLARE @TableName				varchar(510)	= NULL
+	--Valores máximos y minimos de tipo de datos de columnas a indexar
+	DECLARE @MinimumLengthForIndex	smallint = 1
+	DECLARE @MaximumLengthForIndex	smallint = 900
+	--Variables para bucle de creación de índices
+	DECLARE @Iterator				int
+	DECLARE @QueryHelper			varchar(510)	= NULL
+	--Variables utilizadas para crear indices (Input = 1)
+	DECLARE @ColumnName				varchar(510)	= NULL
+	DECLARE @DataType				varchar(255)	= NULL
+	DECLARE @CharacterMaximumLength int				= NULL
+	--Tabla que almacenará todos los índices existentes en DB
+	DECLARE @CreatedIndexes TABLE 
+	(
+		Id int NOT NULL,
+		TableName varchar(510) NOT NULL,
+		IndexType varchar(25) NOT NULL,
+		IndexName varchar(510) NOT NULL,
+		OrdinalPosition int NOT NULL,
+		IndexedColumn varchar(510) NOT NULL,
+		IsPrimaryKey int,
+		Primary Key(Id)
+	)
+
+	--Se insertan todos los índices creados en la base de datos actual en tabla CreatedIndexes
+	INSERT INTO @CreatedIndexes (Id, TableName, IndexType, IndexName, OrdinalPosition, IndexedColumn, IsPrimaryKey)
+	SELECT
+		ROW_NUMBER() OVER (ORDER BY IndexedInfo.Table_Name, IndexedInfo.column_id, IndexedInfo.Index_Name) AS Column_ID,
+		IndexedInfo.Table_Name AS TableName,
+		IndexedInfo.Index_Type,
+		IndexedInfo.Index_Name,
+		IndexedInfo.column_id AS OrdinalPosition,
+		IndexedInfo.IndexedColumn,
+		IndexedInfo.is_primary_key
+	FROM 
+		(
+			SELECT
+				DB_NAME() AS Database_Name,
+				sch.name AS Schema_Name,
+				obj.name AS Table_Name,
+				ind.type_desc AS Index_Type,
+				indcol.column_id,
+				col.name AS IndexedColumn,
+				ind.is_primary_key,
+				ind.name AS Index_Name
+			FROM 
+				sys.indexes ind
+				INNER JOIN sys.objects obj
+					ON ind.object_id     = obj.object_id
+				INNER JOIN sys.schemas sch			
+					ON obj.schema_id     = sch.schema_id
+				INNER JOIN sys.index_columns indcol
+					ON ind.object_id     = indcol.object_id
+					AND ind.index_id     = indcol.index_id
+				INNER JOIN sys.columns col
+					ON indcol.column_id  = col.column_id 
+					AND indcol.object_id = col.object_id
+			WHERE 
+				ind.name IS NOT NULL 
+				AND obj.type = 'U'
+		)
+	AS IndexedInfo
+BEGIN TRY
+	--Si el valor ingresado es = 1, es decir, se desea crear índices
+	IF @Input = 1
+	BEGIN
+		--Tabla con información de todas las columnas en la database
+		DECLARE @Columns TABLE 
+		(
+			OrdinalPosition int NOT NULL,
+			TableName varchar(510) NOT NULL,
+			ColumnName varchar(510) NOT NULL,
+			DataType varchar(255) NOT NULL,
+			MaximumLength int,
+			IndexName varchar(510) NOT NULL
+		)
+		--Tabla que guardará información de todas las columnas que no posean ya un índice
+		DECLARE @UnindexedColumns TABLE 
+		(
+			Id int NOT NULL,
+			TableName varchar(510) NOT NULL,
+			ColumnName varchar(510) NOT NULL,
+			DataType varchar(255) NOT NULL,
+			MaximumLength int,
+			OrdinalPosition int NOT NULL,
+			IndexName varchar(510) NOT NULL,
+			Primary Key(Id)
+		)
+		--Inserción de datos de todas las columnas existentes en la database
+		INSERT INTO @Columns (OrdinalPosition, TableName, ColumnName, DataType, MaximumLength, IndexName)
+		SELECT
+			Ordinal_Position,
+			Table_name,
+			Column_name,
+			Data_Type,
+			Character_Maximum_Length,
+			'i' + Column_Name + '_' + Table_Name + '_Auto' AS IndexName --Nomenclatura de los índices a agregar. i_Columna_Tabla_Auto
+		FROM INFORMATION_SCHEMA.COLUMNS
+
+		--Se añaden las columnas sin indexar a la tabla @UnindexedColumns
+		INSERT INTO @UnindexedColumns (Id, TableName, ColumnName, DataType, MaximumLength, OrdinalPosition, IndexName)
+		SELECT
+			ROW_NUMBER() OVER (ORDER BY Col.TableName, Col.OrdinalPosition) AS Id,
+			Col.TableName,
+			Col.ColumnName,
+			Col.DataType,
+			Col.MaximumLength,
+			Col.OrdinalPosition,
+			Col.IndexName
+		FROM 
+			@Columns Col
+			LEFT JOIN @CreatedIndexes Ind 
+				ON Col.ColumnName =	Ind.IndexedColumn
+				AND Col.TableName = Ind.TableName
+		WHERE 
+			(
+				Col.maximumLength	   IS NULL
+				OR (Col.maximumLength  BETWEEN @MinimumLengthForIndex AND @MaximumLengthForIndex)
+			)
+			AND Ind.Id IS NULL
+
+		--Se inicia la inserción de Índices
+		--Contador de números de columnas sin indexar
+		SET @columnQuantity = (SELECT COUNT(1) FROM @UnindexedColumns)
+		--Ingresa un índice por columna, termina bucle al ingresar índice en la última columna
+		Print ('Se ingresarán '+CAST(@columnQuantity AS VARCHAR)+' Indices')
+		Set @Iterator = 0
+		WHILE (@Iterator < @ColumnQuantity)
+		BEGIN
+			SET @Iterator	 = @Iterator + 1;
+			Select			 
+				@IndexName   = IndexName,
+				@TableName   = TableName,
+				@ColumnName  = ColumnName
+			from
+				@UnindexedColumns
+			where
+				Id			 = @Iterator
+			Print ('inserción número: '+ CAST(@Iterator AS VARCHAR) + ', Inserción de índice ' + CAST(@IndexName AS VARCHAR))
+			SET	@QueryHelper = 'CREATE INDEX ' + @IndexName + ' ON ' + @TableName + '(' + @ColumnName + ')'
+			EXEC (@QueryHelper) --Ejecución de query que crea índices
+		END
+		SET @OutMessage = 'Creación de índices exitoso'
+	END
+
+	--Si input ha sido 2, es decir, se quieren borrar los índices creados con anterioridad
+	ELSE IF @Input = 2
+	BEGIN
+		--Elimina de la tabla @CreatedIndexes las tablas que NO se desean eliminar
+		DELETE FROM @CreatedIndexes
+		WHERE RIGHT(IndexName, 5) != '_AUTO'
+		--Tabla que almacena todos los índices que se van a eliminar
+		DECLARE @IndexesToDrop TABLE 
+		(
+			Id int NOT NULL,
+			TableName varchar(510) NOT NULL,
+			IndexName varchar(510) NOT NULL,
+			Primary Key(Id)
+		)
+		--Inserción de información de índices a eliminar
+		INSERT INTO @IndexesToDrop (Id, TableName, IndexName)
+		SELECT
+			ROW_NUMBER() OVER (ORDER BY TableName, IndexName) AS Column_ID,
+			TableName,
+		    IndexName
+		FROM 
+			@CreatedIndexes
+		--Contador de números de columnas sin indexar
+		SET @columnQuantity = (SELECT COUNT(*) FROM @IndexesToDrop)
+		Print ('Se eliminarán '+CAST(@columnQuantity AS VARCHAR)+' indices')
+		--Se inicia la eliminación de Índices insertados
+		Set @Iterator = 0
+		WHILE (@Iterator < @ColumnQuantity)
+		BEGIN
+			SET @Iterator	 = @Iterator + 1;
+			Select			 
+				@TableName   = TableName,
+				@IndexName   = IndexName
+			from
+				@IndexesToDrop
+			where
+				Id			 = @Iterator
+				Print ('Eliminación número: '+ CAST(@Iterator AS VARCHAR) + ', Eliminación de índice ' + CAST(@IndexName AS VARCHAR))
+			SET @QueryHelper = 'DROP INDEX ' + @TableName + '.' + @IndexName
+			EXEC (@QueryHelper) --Ejecución de query
+		END
+		SET @OutMessage = 'Eliminación de índices exitoso'
+	END
+	ELSE
+	BEGIN
+		SET @OutMessage = 'Valor ingresado es inválido'
+	END
+	END TRY
+	--Captura de error
+	BEGIN CATCH
+		DECLARE @ErrorNumber int = ERROR_NUMBER()
+		DECLARE @ErrorSeverity int = ERROR_SEVERITY()
+		DECLARE @ErrorState int = ERROR_STATE()
+		DECLARE @ErrorMsg nvarchar(MAX) = ERROR_MESSAGE()
+
+		IF ERROR_PROCEDURE() IS NULL
+		BEGIN
+			SET @OutMessage = 'Error '+CAST(@ErrorNumber AS VARCHAR)+', Severidad '+CAST(@ErrorSeverity AS VARCHAR)+', Estado '+CAST(@ErrorState AS VARCHAR)+', L'+CAST(ERROR_LINE() AS VARCHAR)+ ' "'+@ErrorMsg+'"'
+		END
+		ELSE
+		BEGIN
+			SET @OutMessage = 'Error '+CAST(@ErrorNumber AS VARCHAR)+', Severidad '+CAST(@ErrorSeverity AS VARCHAR)+', Estado '+CAST(@ErrorState AS VARCHAR)+', Procedimiento '+ERROR_PROCEDURE()+', L'+CAST(ERROR_LINE() AS VARCHAR)+ ' "'+@ErrorMsg+'"'
+		END 
+
+		IF @@TRANCOUNT > 0
+			ROLLBACK;
+		THROW;
+	END CATCH 
+END
+-------------------------------------------------------------------------------------------------------------------------
